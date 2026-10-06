@@ -165,6 +165,7 @@ const server = http.createServer(async (req, res) => {
             id: str(i.id, 80),
             title: str(i.title, 120),
             size: str(i.size, 20),
+            color: str(i.color, 40),
             quantity: Math.max(1, Math.min(99, Number(i.quantity) || 1)),
             price: Number(i.price) || 0,
           }))
@@ -190,7 +191,7 @@ const server = http.createServer(async (req, res) => {
         payment: 'Cash on delivery',
       };
       const id = await store.create(order);
-      console.log(`New order ${id} from ${customer.name}, total ${order.total}`);
+      console.log(`New order ${id} from ${customer.name}, total Rs ${order.total}`);
       return send(req, res, 201, { id });
     }
 
