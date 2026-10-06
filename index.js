@@ -15,7 +15,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean);
 
 if (!ADMIN_PASSWORD) {
-  console.error('ADMIN_PASSWORD environment variable is required.');
+  console.error('MISSING SETTING: add the variable ADMIN_PASSWORD in your host settings (Variables tab), then redeploy.');
   process.exit(1);
 }
 
@@ -25,15 +25,31 @@ const STATUSES = ['new', 'confirmed', 'shipped', 'delivered', 'cancelled'];
 let store;
 
 if (DATABASE_URL) {
-  const pool = new pg.Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-  await pool.query(`
+  const CREATE = `
     CREATE TABLE IF NOT EXISTS orders (
       seq SERIAL PRIMARY KEY,
       id TEXT UNIQUE NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       status TEXT NOT NULL DEFAULT 'new',
       data JSONB NOT NULL
-    )`);
+    )`;
+  // Hosted databases usually need SSL, Railway's internal one does not: try SSL first, then plain
+  let pool;
+  for (const ssl of [{ rejectUnauthorized: false }, false]) {
+    pool = new pg.Pool({ connectionString: DATABASE_URL, ssl });
+    try {
+      await pool.query(CREATE);
+      break;
+    } catch (e) {
+      console.error(`Database connection failed (ssl=${!!ssl}): ${e.message}`);
+      await pool.end().catch(() => {});
+      pool = null;
+    }
+  }
+  if (!pool) {
+    console.error('Could not connect to the database. Check DATABASE_URL.');
+    process.exit(1);
+  }
   const rowToOrder = (r) => ({ ...r.data, id: r.id, createdAt: r.created_at.toISOString(), status: r.status });
   store = {
     async list() {
