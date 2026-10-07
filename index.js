@@ -20,6 +20,7 @@ if (!ADMIN_PASSWORD) {
 }
 
 const STATUSES = ['new', 'confirmed', 'shipped', 'delivered', 'cancelled'];
+const REVIEW_STATUSES = ['pending', 'approved', 'hidden'];
 
 // ---------- storage: Postgres in production, JSON file when DATABASE_URL is not set (local testing) ----------
 let store;
@@ -50,6 +51,17 @@ if (DATABASE_URL) {
     console.error('Could not connect to the database. Check DATABASE_URL.');
     process.exit(1);
   }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reviews (
+      id SERIAL PRIMARY KEY,
+      product_id TEXT NOT NULL,
+      order_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      data JSONB NOT NULL,
+      UNIQUE (order_id, product_id)
+    )`);
+  const rowToReview = (r) => ({ ...r.data, id: r.id, productId: r.product_id, orderId: r.order_id, status: r.status, createdAt: r.created_at.toISOString() });
   const rowToOrder = (r) => ({ ...r.data, id: r.id, createdAt: r.created_at.toISOString(), status: r.status });
   store = {
     async list() {
@@ -61,6 +73,29 @@ if (DATABASE_URL) {
       const id = 'HX-' + (1000 + Number(n));
       await pool.query('INSERT INTO orders (seq, id, data) VALUES ($1, $2, $3)', [n, id, order]);
       return id;
+    },
+    async getOrder(id) {
+      const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+      return rows[0] ? rowToOrder(rows[0]) : null;
+    },
+    async listReviews({ status, productId } = {}) {
+      const { rows } = await pool.query(
+        'SELECT * FROM reviews WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR product_id = $2) ORDER BY id DESC',
+        [status || null, productId || null]
+      );
+      return rows.map(rowToReview);
+    },
+    async hasReview(orderId, productId) {
+      const { rows } = await pool.query('SELECT 1 FROM reviews WHERE order_id = $1 AND product_id = $2', [orderId, productId]);
+      return rows.length > 0;
+    },
+    async createReview(r) {
+      const { productId, orderId, ...data } = r;
+      await pool.query('INSERT INTO reviews (product_id, order_id, data) VALUES ($1, $2, $3)', [productId, orderId, data]);
+    },
+    async setReviewStatus(id, status) {
+      const { rows } = await pool.query('UPDATE reviews SET status = $2 WHERE id = $1 RETURNING *', [id, status]);
+      return rows[0] ? rowToReview(rows[0]) : null;
     },
     async setStatus(id, status) {
       const { rows } = await pool.query('UPDATE orders SET status = $2 WHERE id = $1 RETURNING *', [id, status]);
@@ -74,7 +109,30 @@ if (DATABASE_URL) {
     try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { return []; }
   };
   const write = (o) => fs.writeFileSync(FILE, JSON.stringify(o, null, 2));
+  const RFILE = path.join(__dirname, 'reviews.json');
+  const readR = () => {
+    try { return JSON.parse(fs.readFileSync(RFILE, 'utf8')); } catch { return []; }
+  };
+  const writeR = (o) => fs.writeFileSync(RFILE, JSON.stringify(o, null, 2));
   store = {
+    async getOrder(id) { return read().find((o) => o.id === id) || null; },
+    async listReviews({ status, productId } = {}) {
+      return readR().filter((r) => (!status || r.status === status) && (!productId || r.productId === productId)).reverse();
+    },
+    async hasReview(orderId, productId) { return readR().some((r) => r.orderId === orderId && r.productId === productId); },
+    async createReview(r) {
+      const all = readR();
+      all.push({ ...r, id: all.length + 1, status: 'pending', createdAt: new Date().toISOString() });
+      writeR(all);
+    },
+    async setReviewStatus(id, status) {
+      const all = readR();
+      const r = all.find((x) => x.id === id);
+      if (!r) return null;
+      r.status = status;
+      writeR(all);
+      return r;
+    },
     async list() { return read().reverse(); },
     async create(order) {
       const orders = read();
@@ -145,6 +203,17 @@ const noteFail = (ip) => {
 };
 
 const str = (v, max) => String(v ?? '').trim().slice(0, max);
+const phoneKey = (p) => String(p ?? '').replace(/\D/g, '').slice(-10);
+
+// at most 10 review attempts per IP per hour
+const reviewHits = new Map();
+const reviewLimited = (ip) => {
+  const now = Date.now();
+  const h = (reviewHits.get(ip) || []).filter((t) => now - t < 60 * 60 * 1000);
+  h.push(now);
+  reviewHits.set(ip, h);
+  return h.length > 10;
+};
 
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
@@ -193,6 +262,59 @@ const server = http.createServer(async (req, res) => {
       const id = await store.create(order);
       console.log(`New order ${id} from ${customer.name}, total Rs ${order.total}`);
       return send(req, res, 201, { id });
+    }
+
+    // ---------- reviews ----------
+    if (url.pathname === '/api/reviews' && req.method === 'GET') {
+      const productId = str(url.searchParams.get('product'), 80);
+      const all = await store.listReviews({ status: 'approved', productId: productId || undefined });
+      const average = all.length ? Math.round((all.reduce((a, r) => a + r.rating, 0) / all.length) * 10) / 10 : 0;
+      const reviews = all.slice(0, 30).map(({ orderId, ...r }) => r);
+      return send(req, res, 200, { count: all.length, average, reviews });
+    }
+
+    if (url.pathname === '/api/reviews' && req.method === 'POST') {
+      if (reviewLimited(ip)) return send(req, res, 429, { error: 'Too many reviews from this connection. Try again later.' });
+      const b = await readBody(req);
+      const orderId = str(b.orderId, 30).toUpperCase();
+      const productId = str(b.productId, 80);
+      const rating = Math.round(Number(b.rating));
+      const comment = str(b.comment, 600);
+      if (!orderId || !productId || !(rating >= 1 && rating <= 5) || comment.length < 5) {
+        return send(req, res, 400, { error: 'Please enter your order number, a star rating and a short comment.' });
+      }
+      const order = await store.getOrder(orderId);
+      const item = order && order.items.find((i) => i.id === productId);
+      const same = order && phoneKey(order.customer.phone) && phoneKey(order.customer.phone) === phoneKey(b.phone);
+      if (!order || !item || !same) {
+        return send(req, res, 400, { error: 'We could not match that order number and phone number to this product.' });
+      }
+      if (order.status !== 'delivered') {
+        return send(req, res, 400, { error: 'You can review a product once your order has been delivered.' });
+      }
+      if (await store.hasReview(orderId, productId)) {
+        return send(req, res, 409, { error: 'You have already reviewed this product for that order.' });
+      }
+      const parts = order.customer.name.split(/\s+/).filter(Boolean);
+      const name = parts.length > 1 ? parts[0] + ' ' + parts[parts.length - 1][0].toUpperCase() + '.' : parts[0] || 'Customer';
+      await store.createReview({ productId, productTitle: item.title, orderId, name, city: order.customer.city, rating, comment });
+      return send(req, res, 201, { ok: true, message: 'Thank you. Your review will appear once it has been approved.' });
+    }
+
+    if (url.pathname === '/api/admin/reviews' && req.method === 'GET') {
+      if (blocked(ip)) return send(req, res, 429, { error: 'Too many attempts. Try again later.' });
+      if (!isAdmin(req)) { noteFail(ip); return send(req, res, 401, { error: 'Unauthorized' }); }
+      return send(req, res, 200, await store.listReviews());
+    }
+
+    const rm = url.pathname.match(/^\/api\/reviews\/(\d+)$/);
+    if (rm && req.method === 'PATCH') {
+      if (blocked(ip)) return send(req, res, 429, { error: 'Too many attempts. Try again later.' });
+      if (!isAdmin(req)) { noteFail(ip); return send(req, res, 401, { error: 'Unauthorized' }); }
+      const { status } = await readBody(req);
+      if (!REVIEW_STATUSES.includes(status)) return send(req, res, 400, { error: 'Bad status' });
+      const r = await store.setReviewStatus(Number(rm[1]), status);
+      return r ? send(req, res, 200, r) : send(req, res, 404, { error: 'Not found' });
     }
 
     if (url.pathname.startsWith('/api/orders')) {
