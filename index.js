@@ -21,6 +21,7 @@ if (!ADMIN_PASSWORD) {
 
 const STATUSES = ['new', 'confirmed', 'shipped', 'delivered', 'cancelled'];
 const REVIEW_STATUSES = ['pending', 'approved', 'hidden'];
+const MESSAGE_STATUSES = ['new', 'read'];
 
 // ---------- storage: Postgres in production, JSON file when DATABASE_URL is not set (local testing) ----------
 let store;
@@ -62,6 +63,14 @@ if (DATABASE_URL) {
       UNIQUE (order_id, product_id)
     )`);
   const rowToReview = (r) => ({ ...r.data, id: r.id, productId: r.product_id, orderId: r.order_id, status: r.status, createdAt: r.created_at.toISOString() });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      status TEXT NOT NULL DEFAULT 'new',
+      data JSONB NOT NULL
+    )`);
+  const rowToMessage = (r) => ({ ...r.data, id: r.id, status: r.status, createdAt: r.created_at.toISOString() });
   const rowToOrder = (r) => ({ ...r.data, id: r.id, createdAt: r.created_at.toISOString(), status: r.status });
   store = {
     async list() {
@@ -73,6 +82,17 @@ if (DATABASE_URL) {
       const id = 'HX-' + (1000 + Number(n));
       await pool.query('INSERT INTO orders (seq, id, data) VALUES ($1, $2, $3)', [n, id, order]);
       return id;
+    },
+    async createMessage(m) {
+      await pool.query('INSERT INTO messages (data) VALUES ($1)', [m]);
+    },
+    async listMessages() {
+      const { rows } = await pool.query('SELECT * FROM messages ORDER BY id DESC');
+      return rows.map(rowToMessage);
+    },
+    async setMessageStatus(id, status) {
+      const { rows } = await pool.query('UPDATE messages SET status = $2 WHERE id = $1 RETURNING *', [id, status]);
+      return rows[0] ? rowToMessage(rows[0]) : null;
     },
     async getOrder(id) {
       const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
@@ -114,7 +134,26 @@ if (DATABASE_URL) {
     try { return JSON.parse(fs.readFileSync(RFILE, 'utf8')); } catch { return []; }
   };
   const writeR = (o) => fs.writeFileSync(RFILE, JSON.stringify(o, null, 2));
+  const MFILE = path.join(__dirname, 'messages.json');
+  const readM = () => {
+    try { return JSON.parse(fs.readFileSync(MFILE, 'utf8')); } catch { return []; }
+  };
+  const writeM = (o) => fs.writeFileSync(MFILE, JSON.stringify(o, null, 2));
   store = {
+    async createMessage(m) {
+      const all = readM();
+      all.push({ ...m, id: all.length + 1, status: 'new', createdAt: new Date().toISOString() });
+      writeM(all);
+    },
+    async listMessages() { return readM().reverse(); },
+    async setMessageStatus(id, status) {
+      const all = readM();
+      const m = all.find((x) => x.id === id);
+      if (!m) return null;
+      m.status = status;
+      writeM(all);
+      return m;
+    },
     async getOrder(id) { return read().find((o) => o.id === id) || null; },
     async listReviews({ status, productId } = {}) {
       return readR().filter((r) => (!status || r.status === status) && (!productId || r.productId === productId)).reverse();
@@ -205,6 +244,16 @@ const noteFail = (ip) => {
 const str = (v, max) => String(v ?? '').trim().slice(0, max);
 const phoneKey = (p) => String(p ?? '').replace(/\D/g, '').slice(-10);
 
+// at most 5 contact messages per IP per hour
+const messageHits = new Map();
+const messageLimited = (ip) => {
+  const now = Date.now();
+  const h = (messageHits.get(ip) || []).filter((t) => now - t < 60 * 60 * 1000);
+  h.push(now);
+  messageHits.set(ip, h);
+  return h.length > 5;
+};
+
 // at most 10 review attempts per IP per hour
 const reviewHits = new Map();
 const reviewLimited = (ip) => {
@@ -262,6 +311,39 @@ const server = http.createServer(async (req, res) => {
       const id = await store.create(order);
       console.log(`New order ${id} from ${customer.name}, total Rs ${order.total}`);
       return send(req, res, 201, { id });
+    }
+
+    // ---------- contact messages ----------
+    if (url.pathname === '/api/messages' && req.method === 'POST') {
+      if (messageLimited(ip)) return send(req, res, 429, { error: 'Too many messages from this connection. Please try again later.' });
+      const b = await readBody(req);
+      if (str(b.website, 100)) return send(req, res, 201, { ok: true }); // hidden spam-trap field was filled in
+      const m = { name: str(b.name, 100), email: str(b.email, 120), phone: str(b.phone, 30), comment: str(b.comment, 2000) };
+      if (!m.name || m.comment.length < 5 || (!m.email && !m.phone)) {
+        return send(req, res, 400, { error: 'Please enter your name, a message, and an email or phone number so we can reply.' });
+      }
+      if (m.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(m.email)) {
+        return send(req, res, 400, { error: 'That email address does not look right.' });
+      }
+      await store.createMessage(m);
+      console.log(`New message from ${m.name}`);
+      return send(req, res, 201, { ok: true, message: 'Thank you. We have received your note and will get back to you soon.' });
+    }
+
+    if (url.pathname === '/api/admin/messages' && req.method === 'GET') {
+      if (blocked(ip)) return send(req, res, 429, { error: 'Too many attempts. Try again later.' });
+      if (!isAdmin(req)) { noteFail(ip); return send(req, res, 401, { error: 'Unauthorized' }); }
+      return send(req, res, 200, await store.listMessages());
+    }
+
+    const mm = url.pathname.match(/^\/api\/messages\/(\d+)$/);
+    if (mm && req.method === 'PATCH') {
+      if (blocked(ip)) return send(req, res, 429, { error: 'Too many attempts. Try again later.' });
+      if (!isAdmin(req)) { noteFail(ip); return send(req, res, 401, { error: 'Unauthorized' }); }
+      const { status } = await readBody(req);
+      if (!MESSAGE_STATUSES.includes(status)) return send(req, res, 400, { error: 'Bad status' });
+      const m = await store.setMessageStatus(Number(mm[1]), status);
+      return m ? send(req, res, 200, m) : send(req, res, 404, { error: 'Not found' });
     }
 
     // ---------- reviews ----------
